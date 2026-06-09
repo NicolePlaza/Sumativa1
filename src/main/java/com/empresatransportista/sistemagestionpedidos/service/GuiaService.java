@@ -10,7 +10,9 @@ import com.empresatransportista.sistemagestionpedidos.repository.TransportistaRe
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
+import java.nio.file.Path;
 import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
 
 @Service
@@ -20,31 +22,43 @@ public class GuiaService {
     private final GuiaRepository guiaRepository;
     private final TransportistaRepository transportistaRepository;
     private final PdfService pdfService;
+    private final S3Service s3Service;
 
-    public GuiaResponseDTO crear(GuiaRequestDTO dto){
-        Transportista transportista = transportistaRepository.findById(dto.getTransportistaId())
-                .orElseThrow(() -> new RuntimeException("Transportista no encontrado"));
+public GuiaResponseDTO crear(GuiaRequestDTO dto) {
+    Transportista transportista = transportistaRepository.findById(dto.getTransportistaId())
+        .orElseThrow(() -> new RuntimeException("Transportista no encontrado"));
 
-        Guia guia = Guia.builder()
-                .numeroGuia(dto.getNumeroGuia())
-                .fecha(dto.getFecha())
-                .transportista(transportista)
-                .origen(dto.getOrigen())
-                .destino(dto.getDestino())
-                .descripcion(dto.getDescripcion())
-                .peso(dto.getPeso())
-                .build();
-        
-        Guia guiaGuardada = guiaRepository.save(guia);
+    Guia guia = Guia.builder()
+        .numeroGuia(dto.getNumeroGuia())
+        .fecha(dto.getFecha())
+        .transportista(transportista)
+        .origen(dto.getOrigen())
+        .destino(dto.getDestino())
+        .descripcion(dto.getDescripcion())
+        .peso(dto.getPeso())
+        .build();
 
-        try {
-            pdfService.generarPdf(guiaGuardada);
-        }catch (Exception e){
-            throw new RuntimeException("Error generando PDF: " + e.getMessage(), e);
-        }
+    Guia guiaGuardada = guiaRepository.save(guia);
 
-        return toResponseDTO(guiaRepository.save(guia));
+    try {
+        Path pdfPath = pdfService.generarPdf(guiaGuardada);
+
+        String s3Key = String.format("%s/%s/guia%d.pdf",
+            guiaGuardada.getFecha().format(DateTimeFormatter.ofPattern("yyyyMMdd")),
+            transportista.getCodigo(),
+            guiaGuardada.getId());
+
+        s3Service.upload(pdfPath, s3Key);
+
+        guiaGuardada.setS3Key(s3Key);
+        guiaGuardada = guiaRepository.save(guiaGuardada);
+
+    } catch (Exception e) {
+        throw new RuntimeException("Error procesando guía: " + e.getMessage(), e);
     }
+
+    return toResponseDTO(guiaGuardada);
+}
 
     public List<GuiaResponseDTO> listar(String codigoTransportista, LocalDate fecha) {
         List<Guia> resultado;
@@ -87,11 +101,20 @@ public class GuiaService {
     }
 
     public void eliminar(Long id) {
-        if (!guiaRepository.existsById(id)) {
-            throw new RuntimeException("Guía no encontrada");
+    Guia guia = guiaRepository.findById(id)
+        .orElseThrow(() -> new RuntimeException("Guía no encontrada"));
+
+    // Borrar de S3 si existe
+    if (guia.getS3Key() != null) {
+        try {
+            s3Service.delete(guia.getS3Key());
+        } catch (Exception e) {
+            System.err.println("No se pudo borrar de S3: " + e.getMessage());
         }
-        guiaRepository.deleteById(id);
     }
+
+    guiaRepository.deleteById(id);
+}
 
     private GuiaResponseDTO toResponseDTO(Guia guia) {
         return GuiaResponseDTO.builder()
@@ -107,4 +130,22 @@ public class GuiaService {
                 .build();
 
     }
+
+    public byte[] descargar(Long id, String userToken) {
+    Guia guia = guiaRepository.findById(id)
+        .orElseThrow(() -> new RuntimeException("Guía no encontrada"));
+
+    // Validación simple de permisos (en producción usarías JWT real)
+    if (userToken == null || userToken.isBlank()) {
+        throw new RuntimeException("Acceso denegado: se requiere autenticación");
+    }
+
+    if (guia.getS3Key() == null) {
+        throw new RuntimeException("La guía no tiene PDF asociado en S3");
+    }
+
+    return s3Service.download(guia.getS3Key());
+}
+
+
 }
